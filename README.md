@@ -1,17 +1,19 @@
-# Continuum release workflow qualification snapshot
+# Continuum release qualification snapshot
 
-This repository mirrors, byte for byte, the reusable workflow
-`.github/workflows/continuum-release.yml` from the audited Continuum change for
-kodmial/continuum#472. It exists only so an isolated qualification consumer can
-pin a `uses:` line to an exact commit before Continuum's own pull request is
-merged.
+This repository mirrors, byte for byte, the audited Continuum change for
+kodmial/continuum#472:
 
-The workflow checks out the release engine from `kodmial/continuum` at the
-`continuum_ref` input. Qualification uses exact Continuum commit
-`dd986d8cb9bd8c0b38a514d8c40a8f4bbc6e1477` (recovery checkpoint generation 3),
-whose `src/continuum/release/` bytes are identical to this change. That engine
-commit contains the binary-mode checksum fix that the earlier `c4ed841`
-qualification attempt exposed on Windows.
+- `.github/workflows/continuum-release.yml` — the reusable release workflow;
+- `src/continuum/` — the release engine and the modules it imports, including
+  the binary-mode checksum fix that the earlier `c4ed841` qualification attempt
+  proved was required on Windows.
 
-This repository is not a Continuum release channel and is not installed by
+The mirror exists only so an isolated qualification consumer can pin a `uses:`
+line and a `continuum_ref` to exact commits before Continuum's own pull request
+is merged. It is not a Continuum release channel and is not installed by
 `install.sh`.
+
+Provenance: the files were copied from the recovery worktree generation 3
+(`dd986d8cb9bd8c0b38a514d8c40a8f4bbc6e1477`) plus the qualified fixes in this
+change. The corresponding Continuum `src/` tree hash is recorded in
+`QUALIFICATION.md` in the consumer repository.

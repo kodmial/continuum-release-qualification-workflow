@@ -1,0 +1,1082 @@
+"""Continuum OpenCode routing: one trusted configuration/qualification/state contract.
+
+A route is frozen before an agent begins side effects. A failed task MUST NOT
+automatically execute again with another route; its recovery owner owns the
+checkpoint and idempotency decision.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import codecs
+from dataclasses import dataclass
+from datetime import timezone
+import email.utils
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from typing import Optional
+
+# This module runs both as a standalone script and as an imported engine
+# module, so put the engine root on the path before importing the shared
+# structured-event classifier.
+_SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
+from continuum.opencode_429_recovery import is_opencode_429  # noqa: E402
+
+MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$")
+REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+STATE_REF = "continuum-model-state"
+STATE_VERSION = 1
+# Only bound a real-completion receipt to its original Actions run attempt.
+# Long-running consumers may finish after the semantic probe TTL expires.
+MAX_EXECUTION_SECONDS = 6 * 60 * 60
+MAX_PENDING_EXECUTIONS = 128
+# A pinned route retries its own qualification/reservation after a concurrent
+# rewrite; the budget keeps a persistent state race from probing forever.
+MAX_SELECTION_RACE_RETRIES = 1
+# A same-model proof refresh may land slightly ahead of this runner's clock.
+# Anything further ahead is corrupt durable state, not fresh qualification.
+MAX_PROBE_CLOCK_SKEW_SECONDS = 60
+
+
+class RouteError(RuntimeError):
+    pass
+
+
+class LocalRuntimeError(RouteError):
+    """The local OpenCode process could not start; no provider was contacted."""
+
+
+class BurnedRunner(RouteError):
+    pass
+
+
+class Conflict(RouteError):
+    pass
+
+
+class SelectionNotVisible(RouteError):
+    """The same-run selection receipt may lag a recent Git state ref write."""
+
+
+class StateValidationError(RouteError):
+    """Durable route state is structurally invalid; never a model failure."""
+
+
+class SelectionStateRace(RouteError):
+    """A concurrent writer replaced the selected route's qualification."""
+
+
+class GitHubStateUnavailable(RouteError):
+    """Sanitized GitHub model-state transport/rate-limit failure.
+
+    Only the classifier and the reset epoch may cross the process boundary.
+    The message never contains the token, the state repository URL, response
+    headers, or Git object contents.
+    """
+
+    def __init__(self, classification: str, not_before: int | None = None):
+        self.classification = classification
+        self.not_before = int(not_before) if not_before else None
+        super().__init__("GitHub model state " + classification)
+
+
+STATE_RATE_LIMIT_FALLBACK_SECONDS = 60
+
+
+def _header(headers, name: str) -> str | None:
+    if headers is None:
+        return None
+    try:
+        value = headers.get(name)
+    except AttributeError:
+        return None
+    return None if value is None else str(value).strip()
+
+
+def _positive_epoch(value: str | None) -> int | None:
+    try:
+        epoch = int(value) if value is not None else 0
+    except (TypeError, ValueError):
+        return None
+    return epoch if epoch > 0 else None
+
+
+def _retry_after_epoch(value: str | None, now: int) -> int | None:
+    if value is None or value == "":
+        return None
+    if value.isdecimal():
+        return now + int(value)
+    try:
+        moment = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if moment is None:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return int(moment.timestamp())
+
+
+def classify_github_state_failure(err: urllib.error.HTTPError,
+                                  now: int | None = None) -> GitHubStateUnavailable | None:
+    """Classify only corroborated GitHub state transport/rate-limit failures.
+
+    A permission/auth 403 (remaining budget, no limit signals) stays a
+    deterministic failure. A 409/422 CAS conflict is handled by the caller.
+    """
+    code = int(getattr(err, "code", 0) or 0)
+    headers = getattr(err, "headers", None)
+    current = int(time.time()) if now is None else int(now)
+    remaining = _header(headers, "X-RateLimit-Remaining")
+    # X-RateLimit-Reset ends the quota window; it is a retry time only once
+    # the primary quota is exhausted.
+    reset = (
+        _positive_epoch(_header(headers, "X-RateLimit-Reset"))
+        if remaining == "0"
+        else None
+    )
+    retry_after = _retry_after_epoch(_header(headers, "Retry-After"), current)
+    not_before = max((value for value in (reset, retry_after)
+                      if value is not None), default=0) or None
+    if not_before is not None and not_before < current:
+        not_before = None
+    if code == 429:
+        return GitHubStateUnavailable(
+            "rate_limit", not_before or current + STATE_RATE_LIMIT_FALLBACK_SECONDS)
+    if code == 403:
+        # Primary limit: the rate limit is exhausted. Secondary/abuse
+        # limits corroborate with Retry-After even when a token-level
+        # remaining count is not zero. Everything else is permission/auth.
+        if remaining == "0" or retry_after is not None:
+            return GitHubStateUnavailable(
+                "rate_limit", not_before or current + STATE_RATE_LIMIT_FALLBACK_SECONDS)
+        return None
+    if 500 <= code <= 599:
+        return GitHubStateUnavailable("transient", not_before)
+    return None
+
+
+def publish_state_failure(error: GitHubStateUnavailable, env=None) -> None:
+    """Expose only a sanitized classifier and reset epoch to later steps."""
+    target = (env if env is not None else os.environ).get("GITHUB_ENV", "")
+    if not target:
+        return
+    with open(target, "a", encoding="utf-8") as output:
+        output.write("CONTINUUM_MODEL_STATE_TRANSIENT=%s\n" % error.classification)
+        if error.not_before:
+            output.write(
+                "CONTINUUM_MODEL_STATE_NOT_BEFORE_EPOCH=%d\n" % error.not_before)
+
+
+def bounded(name: str, value: str, default: int, minimum: int, maximum: int) -> int:
+    if value is None or value == "":
+        return default
+    if not value.isdecimal() or not minimum <= int(value) <= maximum:
+        raise RouteError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return int(value)
+
+
+@dataclass(frozen=True)
+class Configuration:
+    models: tuple[str, ...]
+    pinned: bool
+    ttl: int = 3600
+    cooldown: int = 900
+    timeout: int = 90
+    task_class: str = "coder"
+
+    @classmethod
+    def parse(cls, pool: str, legacy: str = "", explicit: str = "",
+              *, ttl: str = "", cooldown: str = "", timeout: str = "",
+              task_class: str = "coder", strategy: str = "sticky-failover"):
+        if strategy != "sticky-failover":
+            raise RouteError("Unsupported OPENCODE_MODEL_STRATEGY")
+        if task_class not in ("coder", "review", "repair"):
+            raise RouteError("Unknown model execution class")
+        if len(pool) > 2048 or len(legacy) > 160 or len(explicit) > 160:
+            raise RouteError("Model configuration too large")
+        if pool:
+            choices = [s.strip() for s in pool.split(",")]
+            if not 1 <= len(choices) <= 8 or any(not s for s in choices):
+                raise RouteError("OPENCODE_MODELS contains empty or excessive routes")
+            if len(set(choices)) != len(choices):
+                raise RouteError("Duplicate OPENCODE_MODELS routes")
+            chosen = explicit.strip()
+            if chosen and chosen not in choices:
+                raise RouteError("Explicit run pin not in trusted OPENCODE_MODELS")
+            models = (chosen,) if chosen else tuple(choices)
+            pin = bool(chosen)
+        else:
+            chosen = explicit.strip() or legacy.strip()
+            if not chosen:
+                raise RouteError("Set trusted OPENCODE_MODELS or legacy OPENCODE_MODEL")
+            models = (chosen,)
+            pin = True
+        if any(not MODEL_ID.fullmatch(model) or any(c in model for c in ("..", "//"))
+               for model in models):
+            raise RouteError("Malformed provider/model route")
+        return cls(models, pin, bounded("probe TTL", ttl, 3600, 60, 86400),
+                   bounded("cooldown", cooldown, 900, 60, 86400),
+                   bounded("probe timeout", timeout, 90, 15, 240), task_class)
+
+    def fingerprint(self, binary_sha: str, scope: str) -> str:
+        data = [list(self.models), self.pinned, self.task_class, binary_sha, scope]
+        return hashlib.sha256(json.dumps(data, separators=(",", ":")).encode()).hexdigest()
+
+
+def publish_cooldown_not_before(config: Configuration, state: dict, now: int,
+                                env: dict | None = None) -> int | None:
+    """Publish the earliest viable route epoch for scheduled recovery.
+
+    Only a verified all-cooling route pool authorizes a hold; never infer one
+    from credentials, malformed state, or an arbitrary probe/runtime error.
+    GITHUB_ENV survives a failed composite action into subsequent job steps.
+    """
+    active = state.get("cooldowns")
+    if not isinstance(active, dict):
+        return None
+    try:
+        deadlines = [int(active.get(model, 0)) for model in config.models]
+    except (TypeError, ValueError):
+        return None
+    if not deadlines or any(value <= now for value in deadlines):
+        return None
+    not_before = min(deadlines)
+    target = (env if env is not None else os.environ).get("GITHUB_ENV", "")
+    if target:
+        with open(target, "a", encoding="utf-8") as output:
+            output.write(f"CONTINUUM_MODEL_NOT_BEFORE_EPOCH={not_before}\n")
+    return not_before
+
+
+def route_order(config: Configuration, state: dict, now: int) -> tuple[str, ...]:
+    cooldowns = state.get("cooldowns") or {}
+    allowed = [m for m in config.models if now >= int(cooldowns.get(m, 0))]
+    if config.pinned:
+        # Pin disables failover, not the circuit breaker.
+        return tuple(allowed)
+    sticky = state.get("last_successful_real_execution") or {}
+    preferred = sticky.get("model")
+    if preferred in allowed:
+        # An expired probe requires fresh qualification of the *same*
+        # last-known-good model, never a silent return to first-list order.
+        allowed.remove(preferred)
+        allowed.insert(0, preferred)
+    return tuple(allowed)
+
+
+def record_cooldown(current: dict, model: str, deadline: int) -> dict:
+    """Record a cooldown without shortening a longer one from another run."""
+    cooldowns = current.get("cooldowns")
+    if not isinstance(cooldowns, dict):
+        cooldowns = {}
+        current["cooldowns"] = cooldowns
+    try:
+        existing = int(cooldowns.get(model, 0))
+    except (TypeError, ValueError):
+        existing = 0
+    cooldowns[model] = max(existing, int(deadline))
+    return current
+
+
+# A stalled free-quota probe still prints this before `opencode run` hangs.
+# Only a `run --format json` error event is authoritative: text/tool events
+# and quoted "429" response prose are never evidence. Termination needs hard
+# evidence too — an HTTP 429 status or the `FreeUsageLimitError` identifier —
+# because a generic "rate limit" message may still be retried successfully by
+# the CLI, and killing the probe would burn the whole selection. The line may
+# still be partial (the child writes without a trailing newline), so the match
+# stops at the quota signature instead of requiring a complete JSON object;
+# `classify` keeps its cross-engine `quota_429` label.
+QUOTA_STALL = re.compile(
+    r'^[ \t]*\{[^\n]*?"type"[ \t]*:[ \t]*"error"'
+    r'[^\n]*?'
+    r'(?:'
+    r'"(?:statusCode|status)"[ \t]*:[ \t]*"?429\b'
+    r'|freeusagelimiterror'
+    r')',
+    re.IGNORECASE | re.MULTILINE)
+QUOTA_EXHAUSTED = "quota_exhausted"
+PROBE_POLL_SECONDS = 0.1
+PROBE_STOP_SECONDS = 5
+PROBE_JOIN_SECONDS = 5
+PROBE_READ_CHUNK = 4096
+# A partial line is re-scanned as more arrives; cap it so one unterminated
+# line cannot make scanning quadratic.
+PROBE_LINE_TAIL = 65536
+
+
+def classify(output: str, rc: int) -> str:
+    text = output.lower()
+    if "freeusagelimiterror" in text or (rc != 0 and re.search(r"\b429\b|rate.limit|quota", text)):
+        return "quota_429"
+    if re.search(r"\b401\b|\b403\b|unauthorized|invalid.api.key|authentication", text):
+        return "authentication"
+    if re.search(r"deprecated|retired|model.not.found|model.unavailable", text):
+        return "unavailable"
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
+    if re.search(r"\b50[0-9]\b|upstream.request.failed|bad.gateway", text):
+        return "upstream"
+    return "invalid_response" if rc == 0 else "execution_error"
+
+
+def extract_response(log: str, expected: str) -> str:
+    output = []
+    observations = []
+    for line in log.splitlines():
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        part = payload.get("part") or {}
+        info = payload.get("info") or {}
+        if not isinstance(part, dict):
+            part = {}
+        if not isinstance(info, dict):
+            info = {}
+        if part.get("type") == "text" and isinstance(part.get("text"), str):
+            output.append(part["text"])
+        if payload.get("type") == "text" and isinstance(payload.get("text"), str):
+            output.append(payload["text"])
+        for entry in (part, info, payload):
+            provider = entry.get("providerID")
+            model = entry.get("modelID")
+            if provider and model:
+                observations.append(f"{provider}/{model}")
+    if observations and any(observed != expected for observed in observations):
+        raise RouteError("OpenCode returned a different observed model")
+    answer = "\n".join(output).strip()
+    if not answer:
+        raise RouteError("Official OpenCode returned no assistant text events")
+    return answer
+
+
+def _probe_environment(home: str) -> dict:
+    # Do not inherit GH_TOKEN, GITHUB_TOKEN, PATs or provider secrets.
+    # Anonymous OpenCode probes use a disposable HOME, no repository checkout.
+    keys = ("PATH", "LANG", "LC_ALL", "TZ", "TERM", "SSL_CERT_FILE", "SSL_CERT_DIR")
+    env = {k: os.environ[k] for k in keys if k in os.environ}
+    env.update(HOME=home, XDG_CONFIG_HOME=home + "/config",
+               XDG_DATA_HOME=home + "/data", XDG_CACHE_HOME=home + "/cache",
+               CI="true")
+    return env
+
+
+def _drain(stream, sink: list[str]) -> None:
+    # Read whatever is available: a stalled child may print its 429 without a
+    # trailing newline, and a full-buffer ``read`` would block until it exits.
+    # ``read1`` returns as soon as any bytes arrive; the incremental decoder
+    # keeps a multi-byte character split across reads intact.
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    try:
+        while True:
+            chunk = stream.buffer.read1(PROBE_READ_CHUNK)
+            if not chunk:
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    sink.append(tail)
+                return
+            text = decoder.decode(chunk)
+            if text:
+                sink.append(text)
+    except (OSError, ValueError):
+        pass
+
+
+def _unscanned(parts: list[str], state: list) -> str:
+    """Return only text appended since the previous call.
+
+    ``state`` holds the count of already-consumed chunks and the trailing
+    partial line, so a signature split across chunk boundaries is still seen
+    while complete lines are never re-scanned.
+    """
+    end = len(parts)
+    if state[0] == end:
+        return ""
+    pending = state[1] + "".join(parts[state[0]:end])
+    state[0] = end
+    boundary = pending.rfind("\n")
+    if boundary < 0:
+        state[1] = pending[-PROBE_LINE_TAIL:]
+    else:
+        state[1] = pending[boundary + 1:]
+    return pending
+
+
+def _stop_probe(process) -> None:
+    try:
+        process.terminate()
+        process.wait(timeout=PROBE_STOP_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=PROBE_STOP_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+    except OSError:
+        pass
+
+
+def semantic_probe(model: str, kind: str, timeout: int, *, runner=subprocess.Popen) -> None:
+    """Run one anonymous qualification probe of ``model`` and classify it.
+
+    ``timeout`` is only the nominal budget: a stalled child can outlive it,
+    because stopping costs up to two ``PROBE_STOP_SECONDS`` waits (terminate,
+    then kill) and joining the two pipe readers costs up to two
+    ``PROBE_JOIN_SECONDS`` budgets (plus one poll interval of granularity),
+    so the real worst case is roughly
+    ``timeout + 2 * PROBE_STOP_SECONDS + 2 * PROBE_JOIN_SECONDS``. Any outer
+    timeout that must contain a probe has to budget for that overhead.
+    """
+    with tempfile.TemporaryDirectory(prefix="continuum-route-probe-") as scratch:
+        if kind == "review":
+            prompt = ("Read only: this function must accept age 18: "
+                      "def eligible(age): return age > 18. "
+                      "State the exact comparison fix; do not modify files.")
+        else:
+            prompt = ("Use your file editing tool to create a file named "
+                      "route-proof.txt in the working directory with exactly "
+                      "the contents ROUTE_PROOF_OK. Report when complete.")
+        command = ["opencode", "run", "--auto", "--format", "json", "--model", model, prompt]
+        try:
+            process = runner(command, cwd=scratch, env=_probe_environment(scratch),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except OSError as error:
+            raise LocalRuntimeError("local_runtime: " + type(error).__name__) from None
+        stdout: list[str] = []
+        stderr: list[str] = []
+        readers = [threading.Thread(target=_drain, args=(process.stdout, stdout), daemon=True),
+                   threading.Thread(target=_drain, args=(process.stderr, stderr), daemon=True)]
+        for reader in readers:
+            reader.start()
+        deadline = time.monotonic() + timeout
+        quota = False
+        timed_out = False
+        stdout_state = [0, ""]
+        stderr_state = [0, ""]
+        try:
+            # A provider 429 is printed within seconds but `opencode run` can
+            # then hang forever. Read while it runs and stop on that signal
+            # instead of reporting a generic timeout for every route. Only
+            # newly appended text is scanned, so a long healthy run stays
+            # linear in the size of its output.
+            while process.poll() is None:
+                if (QUOTA_STALL.search(_unscanned(stdout, stdout_state))
+                        or QUOTA_STALL.search(_unscanned(stderr, stderr_state))):
+                    quota = True
+                    break
+                if time.monotonic() >= deadline:
+                    _stop_probe(process)
+                    timed_out = True
+                    break
+                time.sleep(PROBE_POLL_SECONDS)
+        finally:
+            if quota:
+                _stop_probe(process)
+            # Every exit path joins the readers and releases the pipes; the
+            # join budget is separate from the terminate/kill grace period.
+            for reader in readers:
+                reader.join(timeout=PROBE_JOIN_SECONDS)
+            # Close only pipes whose reader already returned. A reader still
+            # blocked in ``read1`` holds the buffer lock (a child or grandchild
+            # can keep the pipe open after terminate/kill), and ``close`` would
+            # then wait on that lock forever, past the probe's own timeout.
+            for stream, reader in zip((process.stdout, process.stderr), readers):
+                if reader.is_alive():
+                    continue
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+        raw_stdout = "".join(stdout)
+        raw = raw_stdout + "\n" + "".join(stderr)
+        # Refuse any second model request on a runner that received a 429,
+        # including one that had to be terminated because it never exited.
+        # Only the shared structured provider classifier may turn a stopped
+        # child into quota death here: the child now exits with the signal
+        # status, so the looser cross-engine classifier would also read prose
+        # such as `"text":"HTTP 429"` as provider evidence.
+        quota_evidence = quota or is_opencode_429(raw, process.returncode)
+        if quota_evidence:
+            marker = Path(os.environ.get("RUNNER_TEMP", scratch)) / "continuum-opencode-429"
+            marker.touch()
+            raise BurnedRunner(QUOTA_EXHAUSTED)
+        if timed_out:
+            # The deadline ended the probe without authoritative quota
+            # evidence; fail over normally.
+            raise RouteError("timeout")
+        if classify(raw, process.returncode) == "quota_429":
+            marker = Path(os.environ.get("RUNNER_TEMP", scratch)) / "continuum-opencode-429"
+            marker.touch()
+            raise BurnedRunner(QUOTA_EXHAUSTED)
+        if process.returncode != 0:
+            raise RouteError(classify(raw, process.returncode))
+        answer = extract_response(raw_stdout, model)
+        if kind == "review":
+            if ">=" not in answer and "greater than or equal" not in answer.lower():
+                raise RouteError("review_capability")
+        else:
+            proof = Path(scratch) / "route-proof.txt"
+            if not proof.is_file() or proof.read_text().strip() != "ROUTE_PROOF_OK":
+                raise RouteError("coding_tool_capability")
+
+
+class GitRefStore:
+    """Small, orphan branch-backed state store with non-force fast-forward CAS.
+
+    State belongs to the repository receiving the model request, not to a
+    public controller. No private repository name or credential goes in a blob.
+    """
+
+    def __init__(self, repository: str, token: str):
+        if not REPOSITORY.fullmatch(repository):
+            raise RouteError("Invalid state repository")
+        if not token:
+            raise RouteError("GitHub contents-write token needed for model state")
+        self.repo = repository
+        self.token = token
+
+    def api(self, method: str, path: str, value: dict | None = None, *, missing=False) -> dict | None:
+        url = "https://api.github.com/repos/" + self.repo + "/" + path
+        data = None if value is None else json.dumps(value).encode()
+        request = urllib.request.Request(
+            url, data=data, method=method,
+            headers={"Authorization": "Bearer " + self.token,
+                     "Accept": "application/vnd.github+json",
+                     "X-GitHub-Api-Version": "2022-11-28",
+                     "Content-Type": "application/json",
+                      "Cache-Control": "no-cache, no-store",
+                      "Pragma": "no-cache"})
+        try:
+            with urllib.request.urlopen(request, timeout=15) as reply:
+                return json.load(reply)
+        except urllib.error.HTTPError as err:
+            if missing and err.code == 404:
+                return None
+            if method in ("PATCH", "POST") and err.code in (409, 422):
+                raise Conflict("Git ref changed concurrently") from None
+            failure = classify_github_state_failure(err)
+            if failure is not None:
+                raise failure from None
+            raise RouteError(f"GitHub model state {method} failed ({err.code})") from None
+        except ValueError:
+            raise GitHubStateUnavailable("malformed response") from None
+        except OSError:
+            raise GitHubStateUnavailable("transient") from None
+
+    def read(self, key: str) -> tuple[dict, str | None, str | None]:
+        ref = self.api("GET", "git/ref/heads/" + STATE_REF, missing=True)
+        if ref is None:
+            return {}, None, None
+        head = ref["object"]["sha"]
+        commit = self.api("GET", "git/commits/" + head)
+        tree = commit["tree"]["sha"]
+        listing = self.api("GET", "git/trees/" + tree + "?recursive=1")
+        entry = next((entry for entry in listing.get("tree", [])
+                      if entry["path"] == "state/" + key + ".json"), None)
+        if entry is None:
+            return {}, head, tree
+        blob = self.api("GET", "git/blobs/" + entry["sha"])
+        value = json.loads(base64.b64decode(blob["content"]).decode())
+        if not isinstance(value, dict) or value.get("schema") != STATE_VERSION:
+            raise RouteError("Unsupported/corrupt durable state schema")
+        return value, head, tree
+
+    def update(self, key: str, mutator) -> dict:
+        for attempt in range(4):
+            current, head, base_tree = self.read(key)
+            updated = mutator(dict(current))
+            updated["schema"] = STATE_VERSION
+            entry = {"path": "state/" + key + ".json", "mode": "100644",
+                     "type": "blob", "content": json.dumps(updated, sort_keys=True)}
+            tree_body = {"tree": [entry]}
+            if base_tree:
+                tree_body["base_tree"] = base_tree
+            tree = self.api("POST", "git/trees", tree_body)
+            commit = self.api("POST", "git/commits",
+                              {"message": "chore: route state [skip ci]",
+                               "tree": tree["sha"], "parents": [head] if head else []})
+            try:
+                if head:
+                    self.api("PATCH", "git/refs/heads/" + STATE_REF,
+                             {"sha": commit["sha"], "force": False})
+                else:
+                    self.api("POST", "git/refs",
+                             {"ref": "refs/heads/" + STATE_REF, "sha": commit["sha"]})
+                return updated
+            except Conflict:
+                if attempt == 3:
+                    raise
+        raise RouteError("Model state CAS budget exhausted")
+
+
+def execution_ticket(environ) -> str:
+    """Privacy-safe, per-run-attempt identifier; no cross-run attestations."""
+    run = environ.get("GITHUB_RUN_ID", "")
+    attempt = environ.get("GITHUB_RUN_ATTEMPT", "")
+    if not (re.fullmatch(r"[0-9]{1,20}", run) and re.fullmatch(r"[0-9]{1,8}", attempt)):
+        raise RouteError("Model route requires a trusted Actions run identity")
+    return hashlib.sha256((run + "/" + attempt).encode()).hexdigest()
+
+
+def reserve_completion(state: dict, ticket: str, model: str, now: int,
+                       probe_at: int) -> dict:
+    """Record qualified-at-selection proof without extending semantic TTL."""
+    if not (0 <= now - probe_at <= 86400):
+        raise RouteError("Invalid qualification timestamp")
+    pending = state.get("qualified_selections", {})
+    if not isinstance(pending, dict):
+        raise StateValidationError("Corrupt model selection state")
+    active = {
+        key: value for key, value in pending.items()
+        if isinstance(value, dict) and isinstance(value.get("at"), int)
+        and 0 <= now - value["at"] <= MAX_EXECUTION_SECONDS
+    }
+    active[ticket] = {"model": model, "at": now, "probe_at": probe_at}
+    if len(active) > MAX_PENDING_EXECUTIONS:
+        active = dict(sorted(active.items(), key=lambda kv: kv[1]["at"])
+                      [-MAX_PENDING_EXECUTIONS:])
+    state["qualified_selections"] = active
+    return state
+
+
+def attest_completion(current: dict, ticket: str, model: str, now: int,
+                      fingerprint: str, ttl: int, execution_id: str,
+                      head: str = "") -> dict:
+    """A live success may outlast probe TTL, but never its run-scoped receipt."""
+    if current.get("fingerprint") != fingerprint:
+        if not current:
+            raise SelectionNotVisible("Model state ref is not visible yet")
+        raise RouteError("Stale model state fingerprint")
+    pending = current.get("qualified_selections") or {}
+    if not isinstance(pending, dict):
+        raise RouteError("Corrupt model selection state")
+    if ticket not in pending:
+        raise SelectionNotVisible("No qualified selection for this run and model")
+    selected = pending[ticket]
+    if not isinstance(selected, dict) or selected.get("model") != model:
+        raise RouteError("No qualified selection for this run and model")
+    selected_at = selected.get("at")
+    probe_at = selected.get("probe_at")
+    if not (isinstance(selected_at, int) and isinstance(probe_at, int)
+            and 0 <= selected_at - probe_at <= ttl
+            and 0 <= now - selected_at <= MAX_EXECUTION_SECONDS):
+        raise RouteError("Model selection proof expired or was not qualified")
+    # Never promote the model of a different run, even if it became the
+    # most recent successful probe after this operation was selected.
+    remaining = dict(pending)
+    del remaining[ticket]
+    current["qualified_selections"] = remaining
+    current["last_successful_real_execution"] = {
+        "model": model, "at": now, "run": execution_id, "head": head,
+    }
+    return current
+
+
+def verified_receipt(state: dict, fingerprint: str, *,
+                     expected_model: Optional[str] = None,
+                     expected_head: Optional[str] = None,
+                     expected_run: Optional[str] = None) -> dict:
+    """Read-only verification of an immutable attested real-execution receipt.
+
+    A fresh public runner must be able to prove the durable Child model state
+    without issuing another LLM request, failing over, or rescanning the whole
+    Child universe.  This validates exactly the stored attestation written by
+    :func:`attest_completion` and optionally binds it to a trusted ephemeral
+    handoff (expected model / exact HEAD / originating run).  ``None`` skips a
+    binding; an explicit empty string is verified exactly.  It never probes
+    and never writes.
+    """
+    receipt = state.get("last_successful_real_execution")
+    if not isinstance(receipt, dict) or not receipt:
+        raise RouteError("No attested real model execution receipt")
+    if state.get("fingerprint") != fingerprint:
+        raise RouteError("Attested receipt does not match the trusted runtime route")
+    model = receipt.get("model")
+    if not isinstance(model, str) or not model:
+        raise RouteError("Attested receipt has no model")
+    if expected_model is not None and model != expected_model:
+        raise RouteError("Attested model differs from the trusted handoff")
+    head = receipt.get("head")
+    head_value = head if isinstance(head, str) else ""
+    if expected_head is not None and head_value != expected_head:
+        raise RouteError("Attested receipt head differs from the exact expected HEAD")
+    run = str(receipt.get("run") or "")
+    if expected_run is not None and run != expected_run:
+        raise RouteError("Attested receipt run differs from the trusted handoff")
+    return {"model": model, "head": head_value, "run": run,
+            "at": receipt.get("at")}
+
+
+def attest_retryable_failure(current: dict, ticket: str, model: str, now: int,
+                             fingerprint: str, reason: str, cooldown: int) -> dict:
+    """Consume only the same run's qualified selection after a model execution failure.
+
+    An invalid_review_format receipt means the real inference finished but produced
+    a review YAML contract rejected by the *upstream PR-Agent parser*. Only the
+    trusted review runner may emit this class after confirming that diagnostic.
+    A syntax error in the PR code, a failed CI check, or a reviewer tool failure
+    is NOT a model-output failure and must never cool down the model.
+    No other Actions run may report a failure for this selection.
+    """
+    if reason not in ("timeout", "quota_429", "upstream", "unavailable",
+                      "invalid_review_format"):
+        raise RouteError("Unsupported real-execution failure reason")
+    if current.get("fingerprint") != fingerprint:
+        if not current:
+            raise SelectionNotVisible("Model state ref is not visible yet")
+        raise RouteError("Stale model state fingerprint")
+    pending = current.get("qualified_selections") or {}
+    if not isinstance(pending, dict):
+        raise RouteError("Corrupt model selection state")
+    if ticket not in pending:
+        raise SelectionNotVisible("No qualified selection for this run and model")
+    selected = pending[ticket]
+    if not isinstance(selected, dict) or selected.get("model") != model:
+        raise RouteError("No qualified selection for this run and model")
+    selected_at = selected.get("at")
+    if not isinstance(selected_at, int) or not 0 <= now - selected_at <= MAX_EXECUTION_SECONDS:
+        raise RouteError("Model selection proof expired or was not qualified")
+    remaining = dict(pending)
+    del remaining[ticket]
+    current["qualified_selections"] = remaining
+    # A large review can run longer than the probe cooldown. Do not reselect
+    # the timed-out model on the very next bounded retry.
+    delay = max(cooldown, 3600) if reason == "timeout" else cooldown
+    active = current.get("cooldowns") or {}
+    if not isinstance(active, dict):
+        raise RouteError("Corrupt model cooldown state")
+    current["cooldowns"] = dict(active)
+    current["cooldowns"][model] = max(int(active.get(model, 0)), now + delay)
+    current["last_failed_real_execution"] = {
+        "model": model, "at": now, "reason": reason,
+    }
+    return current
+
+
+def route_key(repo: str, profile: str, credentials: str, config: Configuration,
+              binary_sha: str) -> str:
+    if not profile or not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", profile):
+        raise RouteError("Invalid trusted route profile")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", credentials):
+        raise RouteError("Invalid trusted credential scope")
+    identity = [repo.lower(), profile, credentials,
+                config.fingerprint(binary_sha, credentials)]
+    return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+
+
+def binary_provenance() -> tuple[str, str]:
+    executable = shutil.which("opencode")
+    if not executable:
+        raise RouteError("Official OpenCode binary missing")
+    binary = Path(executable).resolve()
+    version_output = subprocess.run([str(binary), "--version"], capture_output=True,
+                                    text=True, timeout=15, check=True).stdout.strip()
+    # OpenCode 2.x can include a prefix/build details in the version banner.
+    # Extract one exact SemVer; the downloaded executable is SHA256 verified.
+    matches = re.findall(r"(?<![0-9.])[0-9]+\.[0-9]+\.[0-9]+(?![0-9.])",
+                         version_output)
+    expected = os.environ.get("CONTINUUM_EXPECTED_OPENCODE_VERSION", "")
+    if len(matches) != 1 or (expected and matches[0] != expected):
+        raise RouteError("OpenCode version differs from verified manifest/override")
+    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    return matches[0], digest
+
+
+def write_outputs(env, values: dict) -> None:
+    target = env.get("GITHUB_OUTPUT")
+    if not target:
+        return
+    with open(target, "a", encoding="utf-8") as output:
+        for key, value in values.items():
+            output.write("%s=%s\n" % (key, value))
+
+
+def persist_bound_receipt(store: GitRefStore, key: str, mutator,
+                          *, sleep=time.sleep) -> dict:
+    """Resolve Git ref read-after-write lag without inventing missing receipts.
+
+    Git ref/blob GETs may briefly observe a pre-selection branch head,
+    even though select's non-force fast-forward commit already succeeded.
+    Bounded retries refresh the ref and require the genuine same-run ticket.
+    All other state errors remain fatal and no provider call is repeated.
+    """
+    for attempt in range(4):
+        try:
+            return store.update(key, mutator)
+        except SelectionNotVisible:
+            if attempt == 3:
+                raise
+            sleep(2 ** attempt)
+    raise RouteError("Receipt state visibility retry budget exhausted")
+
+
+def run() -> int:
+    cli = argparse.ArgumentParser()
+    cli.add_argument("operation", choices=("select", "record", "fail", "verify"))
+    args = cli.parse_args()
+    env = os.environ
+    config = Configuration.parse(
+        env.get("OPENCODE_MODELS", ""), env.get("OPENCODE_MODEL", ""),
+        env.get("CONTINUUM_EXPLICIT_MODEL", ""),
+        ttl=env.get("OPENCODE_PROBE_TTL", ""),
+        cooldown=env.get("OPENCODE_MODEL_COOLDOWN", ""),
+        timeout=env.get("OPENCODE_PROBE_TIMEOUT", ""),
+        task_class=env.get("CONTINUUM_MODEL_TASK_CLASS", "coder"),
+        strategy=env.get("OPENCODE_MODEL_STRATEGY", "sticky-failover"))
+    if args.operation == "select" and (Path(env.get("RUNNER_TEMP", tempfile.gettempdir())) / "continuum-opencode-429").exists():
+        raise BurnedRunner("runner already burned")
+    version, digest = binary_provenance()
+    owner = env.get("CONTINUUM_MODEL_STATE_REPOSITORY") or env.get("GITHUB_REPOSITORY", "")
+    credential_scope = env.get("CONTINUUM_MODEL_CREDENTIAL_SCOPE", "anonymous")
+    key = route_key(owner, env.get("CONTINUUM_MODEL_PROFILE", "default"),
+                    credential_scope, config, digest)
+    store = GitRefStore(owner, env.get("CONTINUUM_MODEL_STATE_TOKEN", ""))
+    now = int(time.time())
+    fingerprint = config.fingerprint(digest, credential_scope)
+    if args.operation == "verify":
+        state, _, _ = store.read(key)
+        receipt = verified_receipt(
+            state, fingerprint,
+            expected_model=env.get("CONTINUUM_EXPECTED_MODEL") or None,
+            expected_head=env.get("CONTINUUM_EXPECTED_HEAD") or None,
+            expected_run=env.get("CONTINUUM_EXPECTED_RUN") or None)
+        write_outputs(env, {"model": receipt["model"], "verified": "true",
+                            "attested_run": receipt["run"],
+                            "attested_head": receipt["head"]})
+        print(receipt["model"])
+        return 0
+    ticket = execution_ticket(env)
+    if args.operation in ("record", "fail"):
+        selected = env.get("CONTINUUM_SELECTED_MODEL", "")
+        execution_id = env.get("GITHUB_RUN_ID", "") + "/" + env.get("GITHUB_RUN_ATTEMPT", "")
+        if selected not in config.models or not execution_id.strip("/"):
+            raise RouteError("Cannot attest unspecified execution")
+        fingerprint = config.fingerprint(digest, credential_scope)
+        if args.operation == "record":
+            def record(current):
+                return attest_completion(
+                    current, ticket, selected, now, fingerprint, config.ttl,
+                    execution_id, env.get("CONTINUUM_TASK_HEAD", ""))
+        else:
+            reason = env.get("CONTINUUM_FAILURE_REASON", "")
+            def record(current):
+                return attest_retryable_failure(
+                    current, ticket, selected, now, fingerprint, reason, config.cooldown)
+        updated = persist_bound_receipt(store, key, record)
+        if args.operation == "fail":
+            # A real provider timeout may retire the LAST viable route.
+            # Propagate its durable cooldown to the workflow so no nested
+            # 15/30-second retry runs before any model can recover.
+            publish_cooldown_not_before(config, updated, now)
+        return 0
+
+    state, _, _ = store.read(key)
+    if state.get("fingerprint") != fingerprint:
+        state = {}
+    pending = state.get("qualified_selections", {})
+    if not isinstance(pending, dict):
+        # Corrupt durable state is a state failure, not a route qualification
+        # failure: reject it before probing or cooling down any model.
+        raise StateValidationError("Corrupt model selection state")
+    order = route_order(config, state, now)
+    if not order:
+        publish_cooldown_not_before(config, state, now)
+        raise RouteError("All trusted routes are cooling down")
+    errors = {}
+    for model in order:
+        stop = False
+        race_attempts = 0
+        while True:
+            # A concurrent run may cool this route after the snapshot (or after
+            # a race refresh); never probe or reserve a route in cooldown.
+            cooldowns = state.get("cooldowns") or {}
+            if now < int(cooldowns.get(model, 0)):
+                errors[model] = "Route is cooling down"
+                stop = config.pinned
+                break
+            last_probe = state.get("last_successful_probe") or {}
+            try:
+                probe_at = int(last_probe.get("at", 0))
+            except (TypeError, ValueError):
+                probe_at = 0
+            qualified = (
+                last_probe.get("model") == model
+                and probe_at <= now + MAX_PROBE_CLOCK_SKEW_SECONDS
+                and now - probe_at <= config.ttl
+            )
+            try:
+                if not qualified:
+                    semantic_probe(model, "review" if config.task_class == "review" else "coder",
+                                   config.timeout)
+            except LocalRuntimeError:
+                # Process creation failed locally, before the provider was contacted.
+                # This runner/runtime fault is shared by every route: do not quarantine
+                # the selected model or spend time probing the rest of the pool.
+                raise
+            except GitHubStateUnavailable:
+                # A GitHub state-store rate limit/transport failure is never a
+                # model-provider failure: do not cool down an otherwise working
+                # route. The sanitized not-before epoch is published at the CLI
+                # boundary instead.
+                raise
+            except BurnedRunner:
+                def pause(current, *, selected_model=model,
+                          deadline=now + config.cooldown):
+                    if current.get("fingerprint") != fingerprint:
+                        current = {"fingerprint": fingerprint, "cooldowns": {}}
+                    return record_cooldown(current, selected_model, deadline)
+                try:
+                    store.update(key, pause)
+                except RouteError:
+                    # The runner is burned regardless; a state-store failure
+                    # must not mask the exit-75 runner-death outcome.
+                    pass
+                raise
+            except RouteError as error:
+                errors[model] = str(error)
+                def pause(current, *, selected_model=model,
+                          deadline=now + config.cooldown):
+                    if current.get("fingerprint") != fingerprint:
+                        current = {"fingerprint": fingerprint, "cooldowns": {}}
+                    return record_cooldown(current, selected_model, deadline)
+                store.update(key, pause)
+                stop = config.pinned
+                break
+            # The route qualified. Persist the selection outside the probe error
+            # handlers: a state-store Conflict/transport failure must propagate
+            # without cooling down a healthy route or failing over.
+            def save(current, *, selected_model=model, snapshot_now=now,
+                     was_qualified=qualified):
+                if current.get("fingerprint") != fingerprint:
+                    current = {"fingerprint": fingerprint, "cooldowns": {}}
+                # Another run may cool this route after the snapshot check
+                # above. Re-check against the state being updated so a cooled
+                # route is never reserved or returned; the handler refreshes
+                # the snapshot and retries or fails over on the same path as
+                # a selection-state race.
+                cooldowns = current.get("cooldowns")
+                if isinstance(cooldowns, dict):
+                    try:
+                        cooled_until = int(cooldowns.get(selected_model, 0))
+                    except (TypeError, ValueError):
+                        cooled_until = 0
+                    if snapshot_now < cooled_until:
+                        raise SelectionStateRace("Selected route is cooling down")
+                current.update(schema=STATE_VERSION, fingerprint=fingerprint,
+                               runtime={"version": version, "sha256": digest},
+                               task_class=config.task_class)
+                if not was_qualified:
+                    current["last_successful_probe"] = {
+                        "model": selected_model, "at": snapshot_now}
+                # The proof's TTL is evaluated at selection time. The
+                # trusted run identity, not probe age at completion, is
+                # authoritative for a successful task receipt.
+                chosen_probe = current.get("last_successful_probe") or {}
+                if chosen_probe.get("model") != selected_model:
+                    raise SelectionStateRace("Selected route has no qualification")
+                at = int(chosen_probe.get("at", 0))
+                if at > snapshot_now + MAX_PROBE_CLOCK_SKEW_SECONDS:
+                    raise StateValidationError(
+                        "Model probe timestamp is implausibly far in the future")
+                if at > snapshot_now:
+                    # A concurrent writer refreshed this same model's proof
+                    # after our snapshot. Treat bounded skew as fresh at our
+                    # snapshot so a healthy route is not cooled down and no
+                    # future timestamp enters the selection receipt.
+                    at = snapshot_now
+                if not 0 <= snapshot_now - at <= config.ttl:
+                    raise RouteError("Selected probe expired before task start")
+                return reserve_completion(
+                    current, ticket, selected_model, snapshot_now, at)
+            try:
+                store.update(key, save)
+            except (GitHubStateUnavailable, Conflict, StateValidationError):
+                # A state-store Conflict/transport failure or corrupt durable state
+                # is never a model-provider failure: never cool down a healthy
+                # route for it.
+                raise
+            except SelectionStateRace as error:
+                # A concurrent writer replaced this route's qualification between
+                # probe and reservation. The route itself is healthy, so refresh
+                # the snapshot. A pinned route retries its own qualification or
+                # reservation instead of exiting; an unpinned pool fails over.
+                errors[model] = str(error)
+                state, _, _ = store.read(key)
+                if state.get("fingerprint") != fingerprint:
+                    state = {}
+                if config.pinned and race_attempts < MAX_SELECTION_RACE_RETRIES:
+                    race_attempts += 1
+                    now = max(now, int(time.time()))
+                    continue
+                stop = config.pinned
+                break
+            except RouteError as error:
+                # The route lost its qualification for a non-concurrency reason
+                # (for example its proof expired before task start). That is a
+                # route-level failure: cool down this model and keep failing over,
+                # exactly like a probe error.
+                errors[model] = str(error)
+                def pause(current, *, selected_model=model,
+                          deadline=now + config.cooldown):
+                    if current.get("fingerprint") != fingerprint:
+                        current = {"fingerprint": fingerprint, "cooldowns": {}}
+                    return record_cooldown(current, selected_model, deadline)
+                store.update(key, pause)
+                stop = config.pinned
+                break
+            write_outputs(env, {"model": model})
+            print(model)
+            return 0
+        if stop:
+            break
+    # Probes can cool every route within this selection attempt. Persist the
+    # actual next eligible epoch instead of immediately spending review retries.
+    latest_state, _, _ = store.read(key)
+    publish_cooldown_not_before(config, latest_state, int(time.time()))
+    raise RouteError("No route qualified: " + "; ".join(errors.values()))
+
+
+def main() -> int:
+    try:
+        return run()
+    except BurnedRunner as error:
+        notice = "OpenCode 429: retire this runner without another LLM request"
+        reason = str(error).strip()
+        # Surface the actual cause (e.g. exhausted free quota) without
+        # changing the stable notice for the generic pre-burned marker.
+        if reason and reason != "runner already burned":
+            notice = f"{notice} ({reason})"
+        print("::error::" + notice, file=sys.stderr)
+        return 75
+    except GitHubStateUnavailable as error:
+        publish_state_failure(error)
+        print("::error::Continuum model routing: GitHub model state " +
+              error.classification + "; durable recovery owns the retry",
+              file=sys.stderr)
+        return 2
+    except RouteError as error:
+        print("::error::Continuum model routing: " + str(error), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
