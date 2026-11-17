@@ -193,7 +193,11 @@ class Receipt:
         for candidate in other.manifests:
             for index, existing in enumerate(manifests):
                 if existing.target == candidate.target:
-                    if existing != candidate:
+                    # Compare release content, not the run-local path: the
+                    # stored receipt names the published asset while a rebuilt
+                    # receipt names the workspace file, and a duplicate event
+                    # must reconcile those two as the same release.
+                    if not existing.same_release(candidate):
                         raise ReceiptError(
                             f"two runs built different bytes for target "
                             f"{candidate.target!r} at {self.version}",

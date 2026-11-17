@@ -621,6 +621,39 @@ class ArtifactManifest:
         )
         return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
+    def same_release(self, other: "ArtifactManifest") -> bool:
+        """Whether two manifests describe the same release content.
+
+        ``Artifact.path`` is deliberately excluded. It records where the bytes
+        sat in the run that produced them: a workspace ``dist`` directory for a
+        build, or the publish job's download directory once the receipt has been
+        stored beside the release asset. A duplicate event rebuilds into a
+        different workspace, and that must not read as "different bytes"; the
+        release identity is the target, source, version, adapter, and every
+        artifact's name, digest, size and claims.
+        """
+
+        if (
+            self.target != other.target
+            or self.source_sha != other.source_sha
+            or self.version != other.version
+            or self.adapter != other.adapter
+            or self.contract_version != other.contract_version
+        ):
+            return False
+
+        def claims(manifest: "ArtifactManifest") -> Dict[str, Dict[str, Any]]:
+            return {
+                item.name: {
+                    key: value
+                    for key, value in item.describe().items()
+                    if key != "path"
+                }
+                for item in manifest.artifacts
+            }
+
+        return claims(self) == claims(other)
+
     def assert_release_source(self, source_sha: str) -> None:
         """Refuse a manifest built from any commit but the approved one."""
 
