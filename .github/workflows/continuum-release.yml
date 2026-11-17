@@ -101,6 +101,14 @@ on:
         required: false
         default: main
         type: string
+      continuum_engine_repository:
+        description: >-
+          Repository holding the audited Continuum engine. Leave the default
+          unless an audited fork or an isolated qualification run must supply
+          the engine; `continuum_ref` is still an exact commit in it.
+        required: false
+        default: kodmial/continuum
+        type: string
       runner:
         description: Runner for plan and preparation jobs
         required: false
@@ -131,7 +139,7 @@ on:
     outputs:
       status:
         description: Final release status (released, no-op, prepared, failed)
-        value: ${{ jobs.publish.outputs.status || jobs.prepare.outputs.status || jobs.plan.outputs.status }}
+        value: ${{ jobs.publish.outputs.status || jobs.plan.outputs.status }}
       version:
         description: Agreed release version
         value: ${{ jobs.plan.outputs.version }}
@@ -193,7 +201,7 @@ jobs:
       - name: Checkout the Continuum release engine
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: kodmial/continuum
+          repository: ${{ inputs.continuum_engine_repository }}
           ref: ${{ inputs.continuum_ref }}
           path: continuum
           fetch-depth: 1
@@ -342,7 +350,7 @@ jobs:
       - name: Checkout the Continuum release engine
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: kodmial/continuum
+          repository: ${{ inputs.continuum_engine_repository }}
           ref: ${{ inputs.continuum_ref }}
           path: continuum
           fetch-depth: 1
@@ -439,13 +447,24 @@ jobs:
           python3 -m continuum.release "${args[@]}"
 
       - name: Upload the prepared release
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: continuum-release-prepared
-          path: |
-            prepared/
-            evidence/
+          # Only the receipts cross this boundary. Uploading `prepared/` as the
+          # artifact root keeps the download at `prepared/receipt-*.json`, which
+          # is exactly the path the build leg imports.
+          path: prepared/
           if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload preparation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-release-prepare-evidence
+          path: evidence/
+          if-no-files-found: warn
           retention-days: 14
 
   build:
@@ -472,7 +491,7 @@ jobs:
       - name: Checkout the Continuum release engine
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: kodmial/continuum
+          repository: ${{ inputs.continuum_engine_repository }}
           ref: ${{ inputs.continuum_ref }}
           path: continuum
           fetch-depth: 1
@@ -579,13 +598,24 @@ jobs:
           python3 -m continuum.release "${args[@]}"
 
       - name: Upload this target's build
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: continuum-release-build-${{ matrix.id }}
-          path: |
-            bundle/
-            evidence/
+          # The artifact root is the bundle directory, so the publish job finds
+          # `receipt-<target>.json` and every declared asset at the top of the
+          # merged download instead of under a `bundle/` prefix.
+          path: bundle/
           if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload this target's build evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: continuum-release-evidence-${{ matrix.id }}
+          path: evidence/
+          if-no-files-found: warn
           retention-days: 14
 
   publish:
@@ -612,7 +642,7 @@ jobs:
       - name: Checkout the Continuum release engine
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: kodmial/continuum
+          repository: ${{ inputs.continuum_engine_repository }}
           ref: ${{ inputs.continuum_ref }}
           path: continuum
           fetch-depth: 1
